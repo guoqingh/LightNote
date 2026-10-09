@@ -1,0 +1,25 @@
+# Local data and editor state
+/data/
+/meta/
+/recovery/
+/backups/
+/test/
+/dist/
+/toolchain/
+/vendor/
+/release/
+*.lightnote.tmp
+*.hl
+*.recovery
+*.log
+*.exe
+*.a
+*.o
+*.zip
+*.7z
+*.bak
+*.tmp
+.env
+.env.*
+*.pem
+*.key
