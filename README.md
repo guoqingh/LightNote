@@ -1,29 +1,38 @@
 # LightNote
 
-Lightweight native Windows text editor based on Win32 and Scintilla.
+LightNote is a lightweight, native Windows TXT editor built with C++/Win32 and Scintilla.
 
-## Features
+## Download for Windows
 
-- UTF-8 text editing and line numbers
-- Find/replace, undo/redo, manual file saving
-- Recovery snapshots for unexpected termination
-- Selection text colors (red, yellow, green, blue, cyan, indigo, purple) and bold formatting
-- Custom blue-and-white application icon
+**[Download the latest Windows EXE](https://github.com/guoqingh/LightNote/releases/latest)**
 
-## Version
+**[Download LightNote.exe — v0.8.3](https://github.com/guoqingh/LightNote/releases/download/v0.8.3/LightNote.exe)**
 
-Source snapshot: V0.7.2 (2026-10-09).
+Download `LightNote.exe` and double-click to start. No installer is required. On first launch, Windows SmartScreen may warn because this independent build is not digitally signed.
 
-## Build requirements
+## Features (v0.8.3)
 
-Windows, a C++17 MinGW-w64 toolchain, and a compatible Scintilla static library / headers. `src/main.cpp` uses Scintilla API and links against its library; these third-party binaries are **not** bundled in this public source snapshot.
+- Open multiple TXT files in a single main window and switch using a left-side document list.
+- Resize the sidebar, drag to reorder documents, and drag TXT files from Explorer into either side.
+- Open the same underlying TXT only once, even when opened repeatedly.
+- Right-click a document in the sidebar to rename it, or use **F2**. The actual file is renamed, without auto-saving unsaved edits.
+- Find/replace, line numbers, undo/redo, **manual** save (Ctrl+S), and separate recovery snapshots.
+- Multi-color text highlighting (red, yellow, green, blue, cyan, indigo, purple) and bold text.
+- Highlight metadata in `%LOCALAPPDATA%\LightNote\meta`, shared across program-version folders since v0.8.3.
 
-This repository intentionally excludes local editor documents, recovery snapshots, local backups, bundled toolchains, and third-party vendor archives. A reproducible build workflow has not yet been added.
+## Notes
 
-## Privacy
+- This is a portable Windows EXE, not a signed installer. Run normally rather than *as administrator* if you want to drag files from Explorer.
+- Recovery is best-effort and does not guarantee preservation of the final moments before sudden power loss.
+- A text document's contents are **not** automatically saved; use Ctrl+S.
+- Local documents, recovery data, backups, credentials, vendor archives and toolchains are not included in this repository.
 
-No desktop TXT files or user data are included.
+## Source snapshot and building
 
-## Third-party components
+Current public source snapshot: **v0.8.3 (2026-10-28)**.
 
-Scintilla is a third-party text editing component. See its own license and official distribution for source and licensing terms.
+The `src/main.cpp` source requires Windows, a compatible C++17 MinGW-w64 toolchain, Scintilla headers and a compatible Scintilla static library. The third-party Scintilla binaries and a fully reproducible standalone build environment are **not** included here.
+
+## Third-party code
+
+LightNote uses the Scintilla editing component. Refer to the component's upstream distribution and license terms.
