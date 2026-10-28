@@ -8,12 +8,36 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <commctrl.h>
+#include <ole2.h>
 
 #include "Scintilla.h"
 
 static HINSTANCE g_hInst = nullptr;
 static HWND g_hwndMain = nullptr;
 static HWND g_hwndEdit = nullptr;
+static HWND g_hwndFiles = nullptr;
+static HWND g_hwndSplitter = nullptr;
+static WNDPROC g_originalSplitterWndProc = nullptr;
+static bool g_resizingSidebar = false;
+static WNDPROC g_originalListWndProc = nullptr;
+static int g_dragStart = -1;
+static int g_activeDoc = -1;
+static HWND g_hwndRenameEdit = nullptr;
+static WNDPROC g_originalRenameWndProc = nullptr;
+static int g_renameIndex = -1;
+struct OpenNote { std::wstring path; HWND editor = nullptr; DWORD lastBackupTick = 0; };
+static std::vector<OpenNote> g_notes;
+static constexpr int SIDEBAR_DEFAULT = 194;
+static constexpr int SIDEBAR_MIN = 112;
+static constexpr int SIDEBAR_MAX = 620;
+static constexpr int SPLITTER_WIDTH = 7;
+static int g_sidebarWidth = SIDEBAR_DEFAULT;
+static constexpr int IDM_FILELIST = 1800;
+static constexpr int IDM_CLOSE_DOC = 1801;
+static constexpr int IDM_RENAME_DOC = 1802;
+static constexpr int IDM_RENAME_EDIT = 1803;
+
 static HWND g_hwndUndoButton = nullptr;
 static HWND g_hwndRedoButton = nullptr;
 static HWND g_hwndSaveButton = nullptr;
@@ -73,6 +97,25 @@ static const int INDIC_BOLD = 17;
 static const int INDICATORS[] = {INDIC_HL_YELLOW, INDIC_HL_GREEN, INDIC_HL_BLUE, INDIC_HL_RED, INDIC_HL_CYAN, INDIC_HL_INDIGO, INDIC_HL_PURPLE, INDIC_BOLD};
 static constexpr int COLOR_COUNT = 7;
 
+static void SnapshotRecovery();
+static void UpdateLineNumberMargin();
+static void ConfigureEditor();
+static void LoadDocument(const std::wstring&);
+static bool ConfirmPendingChanges();
+static std::wstring NewNotePath();
+static LRESULT CALLBACK EditWndProc(HWND,UINT,WPARAM,LPARAM);
+static void LayoutEditors(HWND);
+static bool OpenDocumentTab(const std::wstring&);
+static void SelectDocument(int);
+static bool CloseDocumentAt(int);
+static void MoveDocument(int,int);
+static void BeginRenameDocument(int);
+static void EndRenameEdit(bool);
+static LRESULT CALLBACK RenameEditWndProc(HWND,UINT,WPARAM,LPARAM);
+static void HandleDroppedFiles(HDROP);
+static void InstallEditorDropTarget(HWND);
+static LRESULT CALLBACK SplitterWndProc(HWND,UINT,WPARAM,LPARAM);
+static LRESULT CALLBACK ListWndProc(HWND,UINT,WPARAM,LPARAM);
 static LRESULT Sci(UINT msg, WPARAM wParam = 0, LPARAM lParam = 0) {
     return SendMessageW(g_hwndEdit, msg, wParam, lParam);
 }
@@ -121,12 +164,42 @@ static uint64_t HashPath(const std::wstring& path) {
     return h;
 }
 
-static std::wstring MetaPath() {
-    std::wstring dir = JoinPath(g_appDir, L"meta");
-    EnsureDir(dir);
+static std::wstring HighlightFileName() {
     wchar_t name[64] = {};
-    swprintf(name, std::size(name), L"%016llx.hl", static_cast<unsigned long long>(HashPath(g_currentPath)));
-    return JoinPath(dir, name);
+    swprintf(name, std::size(name), L"%016llx.hl",
+             static_cast<unsigned long long>(HashPath(g_currentPath)));
+    return name;
+}
+
+static std::wstring LegacyMetaPath() {
+    return JoinPath(JoinPath(g_appDir, L"meta"), HighlightFileName());
+}
+
+// Use a per-user location independent of where an EXE version was extracted.
+// Keep a legacy fallback below for portable installations predating V0.8.3.
+static std::wstring MetaPath() {
+    wchar_t localData[MAX_PATH * 4] = {};
+    const DWORD length = GetEnvironmentVariableW(
+        L"LOCALAPPDATA", localData, static_cast<DWORD>(std::size(localData)));
+    if (length == 0 || length >= std::size(localData)) {
+        const std::wstring oldDir = JoinPath(g_appDir, L"meta");
+        EnsureDir(oldDir);
+        return LegacyMetaPath();
+    }
+    const std::wstring dir = JoinPath(JoinPath(localData, L"LightNote"), L"meta");
+    EnsureDir(dir);
+    return JoinPath(dir, HighlightFileName());
+}
+
+static std::wstring HighlightReadPath() {
+    const std::wstring shared = MetaPath();
+    if (GetFileAttributesW(shared.c_str()) != INVALID_FILE_ATTRIBUTES) return shared;
+    const std::wstring legacy = LegacyMetaPath();
+    if (_wcsicmp(shared.c_str(), legacy.c_str()) == 0) return shared;
+    if (GetFileAttributesW(legacy.c_str()) == INVALID_FILE_ATTRIBUTES) return shared;
+    // One-time migration for an existing local highlight file; never overwrite.
+    if (CopyFileW(legacy.c_str(), shared.c_str(), TRUE)) return shared;
+    return legacy; // Preserve visibility if the migration failed.
 }
 
 static std::wstring BackupDir() {
@@ -192,13 +265,31 @@ static std::string GetDocumentText() {
 }
 
 static void UpdateTitle(bool dirty = false) {
-    std::wstring title = L"LightNote V0.7.2";
+    std::wstring title = L"LightNote V0.8.3";
     if (!g_currentPath.empty()) {
         title += L" - ";
         title += FileNamePtr(g_currentPath);
     }
     if (dirty) title += L" *";
-    SetWindowTextW(g_hwndMain, title.c_str());
+    if (g_hwndMain) SetWindowTextW(g_hwndMain, title.c_str());
+    if (g_hwndFiles && g_activeDoc >= 0 && g_activeDoc < static_cast<int>(g_notes.size())) {
+        std::wstring item = FileNamePtr(g_currentPath);
+        if (dirty) item += L"  *";
+        const LRESULT length = SendMessageW(g_hwndFiles, LB_GETTEXTLEN, g_activeDoc, 0);
+        std::wstring previous;
+        if (length != LB_ERR && length >= 0) {
+            previous.resize(static_cast<size_t>(length) + 1);
+            SendMessageW(g_hwndFiles, LB_GETTEXT, g_activeDoc,
+                         reinterpret_cast<LPARAM>(&previous[0]));
+            previous.resize(static_cast<size_t>(length));
+        }
+        if (previous != item) {
+            SendMessageW(g_hwndFiles, LB_DELETESTRING, g_activeDoc, 0);
+            SendMessageW(g_hwndFiles, LB_INSERTSTRING, g_activeDoc,
+                         reinterpret_cast<LPARAM>(item.c_str()));
+        }
+        SendMessageW(g_hwndFiles, LB_SETCURSEL, g_activeDoc, 0);
+    }
 }
 
 static void ConfigureIndicators() {
@@ -259,7 +350,7 @@ static void LoadHighlights() {
     LRESULT len = Sci(SCI_GETLENGTH);
     for (int id : INDICATORS) ClearIndicator(id, 0, len);
 
-    FILE* f = _wfopen(MetaPath().c_str(), L"rb");
+    FILE* f = _wfopen(HighlightReadPath().c_str(), L"rb");
     if (!f) return;
 
     int color = 0;
@@ -353,6 +444,46 @@ static void ResetAutoSaveTimer() {
     UpdateTitle(Sci(SCI_GETMODIFY)!=0);
 }
 
+// Resolve relative paths and slash variants before comparing open documents.
+static std::wstring NormalizeDocumentPath(const std::wstring& raw) {
+    if (raw.empty()) return {};
+    std::wstring candidate = raw;
+    std::replace(candidate.begin(), candidate.end(), L'/', L'\\');
+    const DWORD required = GetFullPathNameW(candidate.c_str(), 0, nullptr, nullptr);
+    if (required == 0 || required > 32767) return {};
+    std::wstring full(static_cast<size_t>(required) + 1, L'\0');
+    const DWORD length = GetFullPathNameW(candidate.c_str(),
+        static_cast<DWORD>(full.size()), &full[0], nullptr);
+    if (length == 0 || length >= full.size()) return {};
+    full.resize(length);
+    return full;
+}
+
+// Two differently spelled paths may refer to one file (8.3 name, junction, hard link).
+static bool SameDocumentPath(const std::wstring& first, const std::wstring& second) {
+    if (first.empty() || second.empty()) return false;
+    if (_wcsicmp(first.c_str(), second.c_str()) == 0) return true;
+    constexpr DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    HANDLE a = CreateFileW(first.c_str(), FILE_READ_ATTRIBUTES, share,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE b = CreateFileW(second.c_str(), FILE_READ_ATTRIBUTES, share,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    BY_HANDLE_FILE_INFORMATION ai = {}, bi = {};
+    const bool same = a != INVALID_HANDLE_VALUE && b != INVALID_HANDLE_VALUE &&
+        GetFileInformationByHandle(a, &ai) && GetFileInformationByHandle(b, &bi) &&
+        ai.dwVolumeSerialNumber == bi.dwVolumeSerialNumber &&
+        ai.nFileIndexHigh == bi.nFileIndexHigh && ai.nFileIndexLow == bi.nFileIndexLow;
+    if (a != INVALID_HANDLE_VALUE) CloseHandle(a);
+    if (b != INVALID_HANDLE_VALUE) CloseHandle(b);
+    return same;
+}
+
+static int FindOpenDocument(const std::wstring& path) {
+    for (int i = 0; i < static_cast<int>(g_notes.size()); ++i)
+        if (SameDocumentPath(g_notes[i].path, path)) return i;
+    return -1;
+}
+
 static std::wstring NewNotePath() {
     std::wstring dir = JoinPath(g_appDir, L"data");
     EnsureDir(dir);
@@ -362,7 +493,15 @@ static std::wstring NewNotePath() {
     wchar_t name[96] = {};
     swprintf(name, std::size(name), L"Note-%04u%02u%02u-%02u%02u%02u.txt",
              st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-    return JoinPath(dir, name);
+    std::wstring candidate = JoinPath(dir, name);
+    int suffix = 2;
+    while (FindOpenDocument(candidate) >= 0 ||
+           GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        std::wstring base(name);
+        if (base.size() >= 4) base.resize(base.size() - 4);
+        candidate = JoinPath(dir, base + L"-" + std::to_wstring(suffix++) + L".txt");
+    }
+    return candidate;
 }
 
 static void LoadDocument(const std::wstring& path) {
@@ -395,17 +534,383 @@ static void LoadDocument(const std::wstring& path) {
     }
 }
 
-static void NewNote() {
-    if (!ConfirmPendingChanges()) return;
-    std::wstring path = NewNotePath();
-    g_currentPath = path;
-    g_loading = true;
-    Sci(SCI_SETTEXT, 0, reinterpret_cast<LPARAM>(""));
-    Sci(SCI_EMPTYUNDOBUFFER);
-    Sci(SCI_SETSAVEPOINT);
-    g_loading = false;
-    UpdateTitle(false);
+static std::wstring SettingsPath() {
+    return JoinPath(g_appDir, L"settings.ini");
+}
+
+static void LayoutEditors(HWND owner) {
+    RECT rc = {};
+    GetClientRect(owner, &rc);
+    const int width = static_cast<int>(rc.right - rc.left);
+    const int height = static_cast<int>(rc.bottom - rc.top);
+    const int sidebar = std::max(0, std::min(g_sidebarWidth, width - 230));
+    const int editorX = sidebar + SPLITTER_WIDTH;
+    if (g_hwndFiles) MoveWindow(g_hwndFiles, 0, 0, sidebar, height, TRUE);
+    if (g_hwndSplitter) MoveWindow(g_hwndSplitter, sidebar, 0, SPLITTER_WIDTH, height, TRUE);
+    for (auto& note : g_notes)
+        if (note.editor) MoveWindow(note.editor, editorX, 0,
+                                    std::max(0, width - editorX), height, TRUE);
+}
+
+static LRESULT CALLBACK SplitterWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_SETCURSOR:
+        SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+        return TRUE;
+    case WM_LBUTTONDOWN:
+        g_resizingSidebar = true;
+        SetCapture(hwnd);
+        SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+        return 0;
+    case WM_MOUSEMOVE:
+        if (g_resizingSidebar && GetCapture() == hwnd) {
+            POINT cursor = {};
+            GetCursorPos(&cursor);
+            ScreenToClient(g_hwndMain, &cursor);
+            RECT rc = {};
+            GetClientRect(g_hwndMain, &rc);
+            const int maxSide = std::max(0, std::min(SIDEBAR_MAX,
+                                               static_cast<int>(rc.right) - 230));
+            const int minSide = std::min(SIDEBAR_MIN, maxSide);
+            const int newWidth = std::max(minSide,
+                              std::min(static_cast<int>(cursor.x) - SPLITTER_WIDTH / 2, maxSide));
+            if (newWidth != g_sidebarWidth) {
+                g_sidebarWidth = newWidth;
+                LayoutEditors(g_hwndMain);
+            }
+        }
+        return 0;
+    case WM_LBUTTONUP:
+        if (g_resizingSidebar) {
+            g_resizingSidebar = false;
+            ReleaseCapture();
+            const std::wstring value = std::to_wstring(g_sidebarWidth);
+            WritePrivateProfileStringW(L"Layout", L"SidebarWidth", value.c_str(),
+                                       SettingsPath().c_str());
+        }
+        return 0;
+    case WM_CAPTURECHANGED:
+        g_resizingSidebar = false;
+        return 0;
+    case WM_ERASEBKGND:
+        return TRUE;
+    case WM_PAINT: {
+        PAINTSTRUCT ps = {};
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT rc = {};
+        GetClientRect(hwnd, &rc);
+        HBRUSH background = CreateSolidBrush(RGB(227, 231, 237));
+        FillRect(dc, &rc, background);
+        DeleteObject(background);
+        HPEN grip = CreatePen(PS_SOLID, 1, RGB(151, 160, 172));
+        HGDIOBJ previousPen = SelectObject(dc, grip);
+        const int cx = (rc.left + rc.right) / 2;
+        const int cy = (rc.top + rc.bottom) / 2;
+        MoveToEx(dc, cx, cy - 17, nullptr);
+        LineTo(dc, cx, cy + 18);
+        SelectObject(dc, previousPen);
+        DeleteObject(grip);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_DROPFILES:
+        SendMessageW(g_hwndMain, WM_DROPFILES, wParam, lParam);
+        return 0;
+    }
+    return CallWindowProcW(g_originalSplitterWndProc, hwnd, msg, wParam, lParam);
+}
+static void SelectDocument(int index) {
+    if(index<0 || index>=static_cast<int>(g_notes.size()) || index==g_activeDoc) return;
+    if(g_hwndEdit && g_activeDoc>=0) {
+        SnapshotRecovery();
+        g_notes[g_activeDoc].lastBackupTick=g_lastBackupTick;
+        ShowWindow(g_hwndEdit,SW_HIDE);
+    }
+    g_activeDoc=index;
+    g_hwndEdit=g_notes[index].editor;
+    g_currentPath=g_notes[index].path;
+    g_lastBackupTick=g_notes[index].lastBackupTick;
+    ShowWindow(g_hwndEdit,SW_SHOW);
+    SendMessageW(g_hwndFiles,LB_SETCURSEL,index,0);
+    UpdateTitle(Sci(SCI_GETMODIFY)!=0);
+    UpdateLineNumberMargin();
     SetFocus(g_hwndEdit);
+}
+static bool OpenDocumentTab(const std::wstring& path) {
+    const std::wstring normalized = NormalizeDocumentPath(path);
+    if (normalized.empty()) return false;
+    const DWORD attributes = GetFileAttributesW(normalized.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY))
+        return false;
+    const int existing = FindOpenDocument(normalized);
+    if (existing >= 0) {
+        SelectDocument(existing);
+        return true;
+    }
+    if(g_hwndEdit) SnapshotRecovery();
+    HWND editor=CreateWindowExW(WS_EX_ACCEPTFILES,L"Scintilla",L"",
+        WS_CHILD|WS_TABSTOP|WS_CLIPCHILDREN|WS_VSCROLL|WS_HSCROLL,
+        0,0,0,0,g_hwndMain,nullptr,g_hInst,nullptr);
+    if(!editor) return false;
+    DragAcceptFiles(editor, TRUE);
+    InstallEditorDropTarget(editor);
+    WNDPROC old=reinterpret_cast<WNDPROC>(SetWindowLongPtrW(editor,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(EditWndProc)));
+    if(!g_originalEditWndProc) g_originalEditWndProc=old;
+    HWND previous=g_hwndEdit;
+    g_hwndEdit=editor;
+    ConfigureEditor();
+    g_notes.push_back({normalized,editor,0});
+    g_activeDoc=static_cast<int>(g_notes.size())-1;
+    SendMessageW(g_hwndFiles,LB_ADDSTRING,0,reinterpret_cast<LPARAM>(FileNamePtr(normalized)));
+    LoadDocument(normalized);
+    if(previous) ShowWindow(previous,SW_HIDE);
+    LayoutEditors(g_hwndMain);
+    ShowWindow(editor,SW_SHOW);
+    SetFocus(editor);
+    return true;
+}
+
+// WM_DROPFILES owns its HDROP, but an OLE STGMEDIUM owns its HGLOBAL.
+// Both use the same path enumeration while releasing only their own resource.
+static void OpenDroppedPaths(HDROP drop) {
+    if (!drop) return;
+    const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+    for (UINT i = 0; i < count; ++i) {
+        const UINT length = DragQueryFileW(drop, i, nullptr, 0);
+        if (!length || length > 32767) continue;
+        std::vector<wchar_t> path(static_cast<size_t>(length) + 1, L'\0');
+        if (DragQueryFileW(drop, i, path.data(), length + 1) != length) continue;
+        const DWORD attributes = GetFileAttributesW(path.data());
+        if (attributes == INVALID_FILE_ATTRIBUTES ||
+            (attributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        OpenDocumentTab(path.data());
+    }
+}
+
+static void HandleDroppedFiles(HDROP drop) {
+    if (!drop) return;
+    OpenDroppedPaths(drop);
+    DragFinish(drop);
+}
+
+class EditorFileDropTarget final : public IDropTarget {
+    volatile LONG references_ = 1;
+    HWND editor_ = nullptr;
+    bool files_ = false;
+    bool text_ = false;
+    bool allowText_ = true;
+
+    static FORMATETC Format(CLIPFORMAT kind) {
+        FORMATETC format = {};
+        format.cfFormat = kind;
+        format.dwAspect = DVASPECT_CONTENT;
+        format.lindex = -1;
+        format.tymed = TYMED_HGLOBAL;
+        return format;
+    }
+
+public:
+    explicit EditorFileDropTarget(HWND editor, bool allowText = true)
+        : editor_(editor), allowText_(allowText) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** result) override {
+        if (!result) return E_POINTER;
+        *result = nullptr;
+        if (IsEqualIID(iid, IID_IUnknown) || IsEqualIID(iid, IID_IDropTarget)) {
+            *result = static_cast<IDropTarget*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return static_cast<ULONG>(InterlockedIncrement(&references_));
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const LONG count = InterlockedDecrement(&references_);
+        if (!count) delete this;
+        return static_cast<ULONG>(count);
+    }
+
+    HRESULT STDMETHODCALLTYPE DragEnter(IDataObject* data, DWORD, POINTL,
+                                        DWORD* effect) override {
+        if (!effect) return E_POINTER;
+        if (!data) { *effect = DROPEFFECT_NONE; return E_INVALIDARG; }
+        FORMATETC files = Format(CF_HDROP);
+        FORMATETC text = Format(CF_UNICODETEXT);
+        files_ = SUCCEEDED(data->QueryGetData(&files));
+        text_ = allowText_ && !files_ && SUCCEEDED(data->QueryGetData(&text));
+        *effect = (files_ || text_) ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE DragOver(DWORD, POINTL, DWORD* effect) override {
+        if (!effect) return E_POINTER;
+        *effect = (files_ || text_) ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE DragLeave() override {
+        files_ = text_ = false;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE Drop(IDataObject* data, DWORD, POINTL point,
+                                    DWORD* effect) override {
+        if (!effect) return E_POINTER;
+        *effect = DROPEFFECT_NONE;
+        if (!data) return E_INVALIDARG;
+        if (files_) {
+            FORMATETC format = Format(CF_HDROP);
+            STGMEDIUM medium = {};
+            if (SUCCEEDED(data->GetData(&format, &medium))) {
+                if (medium.tymed == TYMED_HGLOBAL) {
+                    OpenDroppedPaths(reinterpret_cast<HDROP>(medium.hGlobal));
+                    *effect = DROPEFFECT_COPY;
+                }
+                ReleaseStgMedium(&medium);
+            }
+        } else if (text_) {
+            FORMATETC format = Format(CF_UNICODETEXT);
+            STGMEDIUM medium = {};
+            if (SUCCEEDED(data->GetData(&format, &medium))) {
+                if (medium.tymed == TYMED_HGLOBAL) {
+                    const wchar_t* value = static_cast<const wchar_t*>(
+                        GlobalLock(medium.hGlobal));
+                    if (value) {
+                        const SIZE_T capacity = GlobalSize(medium.hGlobal) / sizeof(wchar_t);
+                        const wchar_t* end = std::find(value, value + capacity, L'\0');
+                        if (end != value + capacity) {
+                            std::wstring wide(value, end);
+                            std::string utf8 = WideToUtf8(wide.c_str());
+                            POINT local = {point.x, point.y};
+                            ScreenToClient(editor_, &local);
+                            LRESULT pos = SendMessageW(editor_, SCI_POSITIONFROMPOINTCLOSE,
+                                                       local.x, local.y);
+                            if (pos < 0) pos = SendMessageW(editor_, SCI_GETCURRENTPOS, 0, 0);
+                            SendMessageW(editor_, SCI_GOTOPOS, pos, 0);
+                            SendMessageW(editor_, SCI_REPLACESEL, 0,
+                                         reinterpret_cast<LPARAM>(utf8.c_str()));
+                            *effect = DROPEFFECT_COPY;
+                        }
+                        GlobalUnlock(medium.hGlobal);
+                    }
+                }
+                ReleaseStgMedium(&medium);
+            }
+        }
+        files_ = text_ = false;
+        return S_OK;
+    }
+};
+
+static void InstallEditorDropTarget(HWND editor) {
+    // Scintilla's original OLE target only recognizes Unicode text, not CF_HDROP.
+    // Replace it with a target that opens Explorer files and also accepts text.
+    RevokeDragDrop(editor);
+    auto* target = new EditorFileDropTarget(editor);
+    const HRESULT registered = RegisterDragDrop(editor, target);
+    target->Release(); // OLE retains its own reference until RevokeDragDrop.
+    if (FAILED(registered)) DragAcceptFiles(editor, TRUE);
+}
+
+static void InstallSidebarDropTarget(HWND list) {
+    // Unlike Scintilla, a native LISTBOX has no OLE file drop target by default.
+    auto* target = new EditorFileDropTarget(list, false);
+    const HRESULT registered = RegisterDragDrop(list, target);
+    target->Release();
+    if (FAILED(registered)) DragAcceptFiles(list, TRUE);
+}
+
+static bool CloseDocumentAt(int index) {
+    if(index<0 || index>=static_cast<int>(g_notes.size())) return false;
+    SelectDocument(index);
+    if(!ConfirmPendingChanges()) return false;
+    HWND gone=g_notes[index].editor;
+    g_notes.erase(g_notes.begin()+index);
+    SendMessageW(g_hwndFiles,LB_DELETESTRING,index,0);
+    ShowWindow(gone,SW_HIDE);
+    DestroyWindow(gone);
+    g_hwndEdit=nullptr; g_activeDoc=-1;
+    if(!g_notes.empty()) SelectDocument(std::min(index,static_cast<int>(g_notes.size())-1));
+    else OpenDocumentTab(NewNotePath());
+    return true;
+}
+static void MoveDocument(int from,int to) {
+    if(from<0||to<0||from>=static_cast<int>(g_notes.size())||to>=static_cast<int>(g_notes.size())||from==to)return;
+    auto note=g_notes[from];
+    g_notes.erase(g_notes.begin()+from);
+    g_notes.insert(g_notes.begin()+to,note);
+    g_activeDoc=to;
+    std::wstring label=FileNamePtr(note.path);
+    if(SendMessageW(note.editor,SCI_GETMODIFY,0,0))label+=L"  *";
+    SendMessageW(g_hwndFiles,LB_DELETESTRING,from,0);
+    SendMessageW(g_hwndFiles,LB_INSERTSTRING,to,reinterpret_cast<LPARAM>(label.c_str()));
+    SendMessageW(g_hwndFiles,LB_SETCURSEL,to,0);
+}
+static LRESULT CALLBACK ListWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_DROPFILES) {
+        SendMessageW(g_hwndMain, WM_DROPFILES, wParam, lParam);
+        return 0;
+    }
+    if (msg == WM_CONTEXTMENU) {
+        POINT screen = {};
+        int index = -1;
+        if (lParam == -1) {
+            index = static_cast<int>(SendMessageW(hwnd, LB_GETCURSEL, 0, 0));
+            RECT row = {};
+            if (index < 0 || index >= static_cast<int>(g_notes.size()) ||
+                SendMessageW(hwnd, LB_GETITEMRECT, index,
+                             reinterpret_cast<LPARAM>(&row)) == LB_ERR) return 0;
+            screen = {row.left + 16, row.bottom};
+            ClientToScreen(hwnd, &screen);
+        } else {
+            screen.x = static_cast<short>(LOWORD(lParam));
+            screen.y = static_cast<short>(HIWORD(lParam));
+            POINT local = screen;
+            ScreenToClient(hwnd, &local);
+            const LPARAM packed = MAKELPARAM(local.x, local.y);
+            const LRESULT hit = SendMessageW(hwnd, LB_ITEMFROMPOINT, 0, packed);
+            if (!HIWORD(hit)) index = static_cast<int>(LOWORD(hit));
+        }
+        if (index < 0 || index >= static_cast<int>(g_notes.size())) return 0;
+        SelectDocument(index);
+        HMENU menu = CreatePopupMenu();
+        if (!menu) return 0;
+        AppendMenuW(menu, MF_STRING, IDM_RENAME_DOC, L"重命名\tF2");
+        const UINT command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                                            screen.x, screen.y, 0, g_hwndMain, nullptr);
+        DestroyMenu(menu);
+        if (command == IDM_RENAME_DOC) BeginRenameDocument(index);
+        return 0;
+    }
+    if (msg == WM_KEYDOWN && wParam == VK_F2) {
+        BeginRenameDocument(g_activeDoc);
+        return 0;
+    }
+    if (msg == WM_LBUTTONDOWN) {
+        const LRESULT hit = SendMessageW(hwnd, LB_ITEMFROMPOINT, 0, lParam);
+        const int index = HIWORD(hit) ? -1 : static_cast<int>(LOWORD(hit));
+        if (index >= 0 && index < static_cast<int>(g_notes.size())) {
+            g_dragStart = index;
+            SelectDocument(index);
+            SetCapture(hwnd);
+            return 0; // Do not let the native list box start its own drag loop.
+        }
+    } else if (msg == WM_LBUTTONUP && g_dragStart >= 0) {
+        const int from = g_dragStart;
+        g_dragStart = -1;
+        const LRESULT hit = SendMessageW(hwnd, LB_ITEMFROMPOINT, 0, lParam);
+        const int to = HIWORD(hit) ? -1 : static_cast<int>(LOWORD(hit));
+        if (GetCapture() == hwnd) ReleaseCapture();
+        if (to >= 0 && to < static_cast<int>(g_notes.size()) && from != to) {
+            MoveDocument(from, to);
+        }
+        return 0;
+    } else if (msg == WM_CAPTURECHANGED) {
+        g_dragStart = -1;
+    }
+    return CallWindowProcW(g_originalListWndProc, hwnd, msg, wParam, lParam);
+}
+static void NewNote() {
+    OpenDocumentTab(NewNotePath());
 }
 
 static void OpenDocumentDialog() {
@@ -418,7 +923,7 @@ static void OpenDocumentDialog() {
     ofn.lpstrFile = path;
     ofn.nMaxFile = static_cast<DWORD>(std::size(path));
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
-    if (GetOpenFileNameW(&ofn) && ConfirmPendingChanges()) LoadDocument(path);
+    if (GetOpenFileNameW(&ofn)) OpenDocumentTab(path);
 }
 
 static void SaveAsDialog() {
@@ -434,9 +939,214 @@ static void SaveAsDialog() {
     ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_EXPLORER;
     ofn.lpstrDefExt = L"txt";
     if (GetSaveFileNameW(&ofn)) {
-        g_currentPath = path;
-        SaveDocument(true);
+        const std::wstring destination = NormalizeDocumentPath(path);
+        if (destination.empty()) return;
+        const int other = FindOpenDocument(destination);
+        if (other >= 0 && other != g_activeDoc) {
+            MessageBoxW(g_hwndMain, L"这个文件已经在左侧打开，不能让两个文档同时指向同一个 TXT。",
+                        L"LightNote", MB_OK | MB_ICONINFORMATION);
+            SelectDocument(other);
+            return;
+        }
+        const std::wstring previous = g_currentPath;
+        const std::wstring oldRecovery = RecoveryPath();
+        g_currentPath = destination;
+        if (SaveDocument(true)) {
+            if (g_activeDoc >= 0) g_notes[g_activeDoc].path = destination;
+            if (_wcsicmp(oldRecovery.c_str(), RecoveryPath().c_str()) != 0)
+                DeleteFileW(oldRecovery.c_str());
+            UpdateTitle(false);
+        } else {
+            g_currentPath = previous;
+            UpdateTitle(Sci(SCI_GETMODIFY) != 0);
+        }
     }
+}
+
+// Rename changes the file itself, not just the label shown in the sidebar.
+static bool ValidDocumentFileName(const std::wstring& name) {
+    if (name.empty() || name.size() > 255 || name == L"." || name == L"..") return false;
+    if (name.back() == L' ' || name.back() == L'.') return false;
+    for (wchar_t ch : name) {
+        if (ch < 32 || wcschr(L"<>:\"/\\|?*", ch)) return false;
+    }
+    std::wstring stem = name.substr(0, name.find(L'.'));
+    static const wchar_t* reserved[] = {
+        L"CON", L"PRN", L"AUX", L"NUL", L"COM1", L"COM2", L"COM3", L"COM4",
+        L"COM5", L"COM6", L"COM7", L"COM8", L"COM9", L"LPT1", L"LPT2",
+        L"LPT3", L"LPT4", L"LPT5", L"LPT6", L"LPT7", L"LPT8", L"LPT9"
+    };
+    for (const wchar_t* device : reserved)
+        if (_wcsicmp(stem.c_str(), device) == 0) return false;
+    return true;
+}
+
+static bool RenameDocument(int index, const std::wstring& newName) {
+    if (index < 0 || index >= static_cast<int>(g_notes.size())) return false;
+    if (!ValidDocumentFileName(newName)) {
+        MessageBoxW(g_hwndMain,
+            L"文件名无效。不能使用 \\ / : * ? \" < > |、末尾空格或句点以及系统保留名称。",
+            L"LightNote 重命名", MB_OK | MB_ICONWARNING);
+        return false;
+    }
+    SelectDocument(index);
+    const std::wstring original = g_notes[index].path;
+    const std::wstring parent = original.substr(0, original.find_last_of(L"\\"));
+    const std::wstring target = NormalizeDocumentPath(JoinPath(parent, newName));
+    if (target.empty()) return false;
+    if (original == target) return true;
+    const int alreadyOpen = FindOpenDocument(target);
+    if (alreadyOpen >= 0 && alreadyOpen != index) {
+        MessageBoxW(g_hwndMain, L"左侧已经打开同一个目标文件，不能重复重命名。",
+                    L"LightNote 重命名", MB_OK | MB_ICONWARNING);
+        return false;
+    }
+    const DWORD targetAttributes = GetFileAttributesW(target.c_str());
+    if (_wcsicmp(original.c_str(), target.c_str()) != 0 &&
+        targetAttributes != INVALID_FILE_ATTRIBUTES) {
+        MessageBoxW(g_hwndMain, L"目标文件名已存在，未覆盖原有文件。",
+                    L"LightNote 重命名", MB_OK | MB_ICONWARNING);
+        return false;
+    }
+
+    const std::wstring oldMeta = MetaPath();
+    const std::wstring oldRecovery = RecoveryPath();
+    const std::wstring oldBackupDir = BackupDir();
+    const DWORD originalAttributes = GetFileAttributesW(original.c_str());
+    const bool originalExists = originalAttributes != INVALID_FILE_ATTRIBUTES;
+    if (!originalExists &&
+        GetLastError() != ERROR_FILE_NOT_FOUND &&
+        GetLastError() != ERROR_PATH_NOT_FOUND) {
+        MessageBoxW(g_hwndMain, L"无法确认原文件状态，重命名已取消。",
+                    L"LightNote 重命名", MB_OK | MB_ICONWARNING);
+        return false;
+    }
+    if (originalExists && !MoveFileExW(original.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH)) {
+        const DWORD error = GetLastError();
+        std::wstring msg = L"磁盘上的文件重命名失败（Windows 错误代码 ";
+        msg += std::to_wstring(error) + L"）。原文件未改动。";
+        MessageBoxW(g_hwndMain, msg.c_str(), L"LightNote 重命名",
+                    MB_OK | MB_ICONERROR);
+        return false;
+    }
+
+    // Keep Scintilla's existing buffer, selection and undo stack in place.
+    g_notes[index].path = target;
+    g_currentPath = target;
+
+    // If the startup QuickNote was renamed, reopen its new name next time.
+    wchar_t preferred[MAX_PATH * 4] = {};
+    GetPrivateProfileStringW(L"Session", L"QuickNoteDocument", L"",
+                             preferred, static_cast<DWORD>(std::size(preferred)),
+                             SettingsPath().c_str());
+    const std::wstring originalQuickNote =
+        JoinPath(JoinPath(g_appDir, L"data"), L"QuickNote.txt");
+    if (_wcsicmp(original.c_str(), originalQuickNote.c_str()) == 0 ||
+        (preferred[0] && _wcsicmp(original.c_str(), preferred) == 0)) {
+        WritePrivateProfileStringW(L"Session", L"QuickNoteDocument",
+                                   target.c_str(), SettingsPath().c_str());
+    }
+
+    const std::wstring newMeta = MetaPath();
+    bool metadataOK = true;
+    if (_wcsicmp(oldMeta.c_str(), newMeta.c_str()) != 0 &&
+        GetFileAttributesW(oldMeta.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        metadataOK = MoveFileExW(oldMeta.c_str(), newMeta.c_str(),
+                                 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+        if (!metadataOK) SaveHighlights();
+    }
+
+    const std::wstring newRecovery = RecoveryPath();
+    bool recoveryOK = true;
+    if (Sci(SCI_GETMODIFY)) {
+        recoveryOK = WriteAllBytesAtomic(newRecovery, GetDocumentText());
+        if (recoveryOK && _wcsicmp(oldRecovery.c_str(), newRecovery.c_str()) != 0)
+            DeleteFileW(oldRecovery.c_str());
+    } else if (_wcsicmp(oldRecovery.c_str(), newRecovery.c_str()) != 0) {
+        DeleteFileW(oldRecovery.c_str());
+    }
+
+    wchar_t backupHash[32] = {};
+    swprintf(backupHash, std::size(backupHash), L"%016llx",
+             static_cast<unsigned long long>(HashPath(target)));
+    const std::wstring newBackupDir = JoinPath(JoinPath(g_appDir, L"backups"), backupHash);
+    bool backupsOK = true;
+    if (_wcsicmp(oldBackupDir.c_str(), newBackupDir.c_str()) != 0 &&
+        GetFileAttributesW(oldBackupDir.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        if (GetFileAttributesW(newBackupDir.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            backupsOK = MoveFileExW(oldBackupDir.c_str(), newBackupDir.c_str(),
+                                    MOVEFILE_WRITE_THROUGH) != FALSE;
+        } else {
+            backupsOK = false; // Keep both history directories; never overwrite a backup.
+        }
+    }
+
+    UpdateTitle(Sci(SCI_GETMODIFY) != 0);
+    if (!metadataOK || !recoveryOK || !backupsOK) {
+        MessageBoxW(g_hwndMain,
+            L"文件名已修改，但部分旧的高亮、恢复或历史备份文件未能迁移。原关联文件已保留，请检查程序目录。",
+            L"LightNote 重命名", MB_OK | MB_ICONWARNING);
+    }
+    return true;
+}
+
+static void EndRenameEdit(bool accept) {
+    if (!g_hwndRenameEdit) return;
+    HWND editor = g_hwndRenameEdit;
+    const int index = g_renameIndex;
+    std::wstring name;
+    if (accept) {
+        const int length = GetWindowTextLengthW(editor);
+        name.resize(static_cast<size_t>(length) + 1);
+        GetWindowTextW(editor, &name[0], length + 1);
+        name.resize(static_cast<size_t>(length));
+    }
+    g_hwndRenameEdit = nullptr;
+    g_renameIndex = -1;
+    DestroyWindow(editor);
+    if (accept) RenameDocument(index, name);
+    if (g_hwndEdit) SetFocus(g_hwndEdit);
+}
+
+static LRESULT CALLBACK RenameEditWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_KEYDOWN) {
+        if (wParam == VK_RETURN) { EndRenameEdit(true); return 0; }
+        if (wParam == VK_ESCAPE) { EndRenameEdit(false); return 0; }
+    } else if (msg == WM_KILLFOCUS && g_hwndRenameEdit == hwnd) {
+        EndRenameEdit(false);
+        return 0;
+    }
+    return CallWindowProcW(g_originalRenameWndProc, hwnd, msg, wParam, lParam);
+}
+
+static void BeginRenameDocument(int index) {
+    if (index < 0 || index >= static_cast<int>(g_notes.size())) return;
+    if (g_hwndRenameEdit) EndRenameEdit(false);
+    SelectDocument(index);
+    RECT row = {};
+    if (SendMessageW(g_hwndFiles, LB_GETITEMRECT, index,
+                     reinterpret_cast<LPARAM>(&row)) == LB_ERR) return;
+    const wchar_t* file = FileNamePtr(g_notes[index].path);
+    POINT location = {row.left + 2, row.top};
+    MapWindowPoints(g_hwndFiles, g_hwndMain, &location, 1);
+    g_renameIndex = index;
+    g_hwndRenameEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", file,
+        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+        location.x, location.y,
+        std::max(70, static_cast<int>(row.right - row.left - 6)),
+        std::max(22, static_cast<int>(row.bottom - row.top + 3)),
+        g_hwndMain, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDM_RENAME_EDIT)),
+        g_hInst, nullptr);
+    if (!g_hwndRenameEdit) { g_renameIndex = -1; return; }
+    SendMessageW(g_hwndRenameEdit, EM_LIMITTEXT, 255, 0);
+    SendMessageW(g_hwndRenameEdit, WM_SETFONT,
+                 SendMessageW(g_hwndFiles, WM_GETFONT, 0, 0), TRUE);
+    g_originalRenameWndProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
+        g_hwndRenameEdit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(RenameEditWndProc)));
+    SetFocus(g_hwndRenameEdit);
+    const wchar_t* dot = wcsrchr(file, L'.');
+    const int stemLength = (dot && dot != file) ? static_cast<int>(dot - file) : -1;
+    SendMessageW(g_hwndRenameEdit, EM_SETSEL, 0, stemLength);
 }
 
 static void ApplyManualHighlight(int id) {
@@ -645,6 +1355,57 @@ static bool HasEditorSelection() {
     return Sci(SCI_GETSELECTIONSTART) != Sci(SCI_GETSELECTIONEND);
 }
 
+static bool IsAsciiCopyTokenChar(int ch) {
+    return (ch >= 'a' && ch <= 'z') ||
+           (ch >= 'A' && ch <= 'Z') ||
+           (ch >= '0' && ch <= '9') ||
+           ch == '_' || ch == '@' || ch == '.' || ch == '-' || ch == '+';
+}
+
+static void NormalizeDoubleClickSelection(LRESULT clicked) {
+    const LRESULT length = Sci(SCI_GETLENGTH);
+    const LRESULT start = Sci(SCI_GETSELECTIONSTART);
+    const LRESULT end = Sci(SCI_GETSELECTIONEND);
+    if (start < end) {
+        LRESULT trimmedEnd = end;
+        while (trimmedEnd > start) {
+            const int ch = static_cast<int>(Sci(SCI_GETCHARAT, static_cast<WPARAM>(trimmedEnd - 1)));
+            if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n') break;
+            --trimmedEnd;
+        }
+        if (trimmedEnd > start && trimmedEnd != end) {
+            Sci(SCI_SETSEL, static_cast<WPARAM>(start), static_cast<LPARAM>(trimmedEnd));
+        }
+    }
+
+    // Scintilla splits an ASCII code or email at '@', '.' and other symbols.
+    // Select the entire token on a double-click, but never its adjacent spaces.
+    if (clicked < 0 || clicked >= length ||
+        !IsAsciiCopyTokenChar(static_cast<int>(Sci(SCI_GETCHARAT, static_cast<WPARAM>(clicked))))) {
+        return;
+    }
+    LRESULT first = clicked;
+    LRESULT last = clicked + 1;
+    while (first > 0 &&
+           IsAsciiCopyTokenChar(static_cast<int>(Sci(SCI_GETCHARAT, static_cast<WPARAM>(first - 1))))) {
+        --first;
+    }
+    while (last < length &&
+           IsAsciiCopyTokenChar(static_cast<int>(Sci(SCI_GETCHARAT, static_cast<WPARAM>(last))))) {
+        ++last;
+    }
+    bool hasWordChar = false;
+    bool hasJoiner = false;
+    for (LRESULT pos = first; pos < last; ++pos) {
+        const int ch = static_cast<int>(Sci(SCI_GETCHARAT, static_cast<WPARAM>(pos)));
+        hasWordChar |= (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9');
+        hasJoiner |= ch == '@' || ch == '.' || ch == '_' || ch == '-' || ch == '+';
+    }
+    if (hasWordChar && hasJoiner) {
+        Sci(SCI_SETSEL, static_cast<WPARAM>(first), static_cast<LPARAM>(last));
+    }
+}
+
 static void ExecuteEditorContextCommand(UINT command) {
     switch (command) {
     case IDM_CTX_CUT:
@@ -742,6 +1503,10 @@ static void ShowEditorContextMenu(HWND hwnd, LPARAM lParam) {
 }
 
 static LRESULT CALLBACK EditWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_DROPFILES) {
+        SendMessageW(g_hwndMain, WM_DROPFILES, wParam, lParam);
+        return 0;
+    }
     if (msg == WM_CONTEXTMENU) {
         ShowEditorContextMenu(hwnd, lParam);
         return 0;
@@ -757,6 +1522,7 @@ static HMENU CreateMainMenu() {
     AppendMenuW(file, MF_STRING, IDM_OPEN, L"打开...\tCtrl+O");
     AppendMenuW(file, MF_STRING, IDM_SAVE, L"保存\tCtrl+S");
     AppendMenuW(file, MF_STRING, IDM_SAVEAS, L"另存为...\tCtrl+Shift+S");
+    AppendMenuW(file, MF_STRING, IDM_CLOSE_DOC, L"关闭当前文档\tCtrl+W");
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(file, MF_STRING, IDM_EXIT, L"退出");
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(file), L"文件");
@@ -849,18 +1615,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     switch (msg) {
     case WM_CREATE: {
-        g_hwndEdit = CreateWindowExW(
-            0, L"Scintilla", L"",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPCHILDREN | WS_VSCROLL | WS_HSCROLL,
-            0, 0, 0, 0, hwnd, nullptr, g_hInst, nullptr);
-        if (!g_hwndEdit) return -1;
-
-        g_originalEditWndProc = reinterpret_cast<WNDPROC>(
-            SetWindowLongPtrW(g_hwndEdit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(EditWndProc)));
-        if (!g_originalEditWndProc) return -1;
-
-        ConfigureEditor();
-
+        g_hwndMain = hwnd;
+        DragAcceptFiles(hwnd, TRUE);
+        g_hwndFiles = CreateWindowExW(WS_EX_CLIENTEDGE | WS_EX_ACCEPTFILES,
+            L"LISTBOX", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL |
+            LBS_NOTIFY | LBS_NOINTEGRALHEIGHT, 0, 0, g_sidebarWidth, 0,
+            hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDM_FILELIST)), g_hInst, nullptr);
+        if (!g_hwndFiles) return -1;
+        g_originalListWndProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
+            g_hwndFiles, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(ListWndProc)));
+        DragAcceptFiles(g_hwndFiles, TRUE);
+        g_hwndSplitter = CreateWindowExW(WS_EX_ACCEPTFILES, L"STATIC", L"",
+            WS_CHILD | WS_VISIBLE | SS_NOTIFY, 0, 0, SPLITTER_WIDTH, 0,
+            hwnd, nullptr, g_hInst, nullptr);
+        if (!g_hwndSplitter) return -1;
+        g_originalSplitterWndProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
+            g_hwndSplitter, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(SplitterWndProc)));
+        DragAcceptFiles(g_hwndSplitter, TRUE);
+        g_hwndEdit = nullptr;
         g_hwndUndoButton = CreateWindowW(L"BUTTON", L"撤销", WS_CHILD | BS_OWNERDRAW,
             6, 4, 82, 27, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDM_UNDO)), g_hInst, nullptr);
         g_hwndRedoButton = CreateWindowW(L"BUTTON", L"重做", WS_CHILD | BS_OWNERDRAW,
@@ -869,16 +1641,28 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             182, 4, 72, 27, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDM_SAVE)), g_hInst, nullptr);
 
         if (!g_startPath.empty()) {
-            LoadDocument(g_startPath);
+            OpenDocumentTab(g_startPath);
         } else {
             std::wstring dataDir = JoinPath(g_appDir, L"data");
             EnsureDir(dataDir);
-            std::wstring quick = JoinPath(dataDir, L"QuickNote.txt");
-            if (GetFileAttributesW(quick.c_str()) == INVALID_FILE_ATTRIBUTES) {
-                WriteAllBytesAtomic(quick, std::string());
+            wchar_t preferred[MAX_PATH * 4] = {};
+            GetPrivateProfileStringW(L"Session", L"QuickNoteDocument", L"",
+                preferred, static_cast<DWORD>(std::size(preferred)),
+                SettingsPath().c_str());
+            const std::wstring saved = NormalizeDocumentPath(preferred);
+            const DWORD attributes = GetFileAttributesW(saved.c_str());
+            if (!saved.empty() && attributes != INVALID_FILE_ATTRIBUTES &&
+                !(attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                OpenDocumentTab(saved);
+            } else {
+                std::wstring quick = JoinPath(dataDir, L"QuickNote.txt");
+                if (GetFileAttributesW(quick.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                    WriteAllBytesAtomic(quick, std::string());
+                }
+                OpenDocumentTab(quick);
             }
-            LoadDocument(quick);
         }
+        InstallSidebarDropTarget(g_hwndFiles);
         return 0;
     }
 
@@ -925,9 +1709,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
 
     case WM_SIZE:
-        if (g_hwndEdit) {
-            MoveWindow(g_hwndEdit, 0, 0, LOWORD(lParam), HIWORD(lParam), TRUE);
-        }
+        LayoutEditors(hwnd);
         return 0;
 
     case WM_SETFOCUS:
@@ -937,6 +1719,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_NOTIFY: {
         SCNotification* scn = reinterpret_cast<SCNotification*>(lParam);
         if (scn && scn->nmhdr.hwndFrom == g_hwndEdit) {
+            if (scn->nmhdr.code == SCN_DOUBLECLICK) {
+                NormalizeDoubleClickSelection(scn->position);
+            }
             if (scn->nmhdr.code == SCN_MODIFIED) {
                 if (scn->modificationType & (SC_MOD_INSERTTEXT | SC_MOD_DELETETEXT)) {
                     UpdateLineNumberMargin();
@@ -956,6 +1741,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         break;
 
     case WM_COMMAND:
+        if(LOWORD(wParam)==IDM_FILELIST && HIWORD(wParam)==LBN_SELCHANGE) {
+            int selected=static_cast<int>(SendMessageW(g_hwndFiles,LB_GETCURSEL,0,0));
+            SelectDocument(selected);return 0;
+        }
         switch (LOWORD(wParam)) {
         case IDM_UNDO: Sci(SCI_UNDO); return 0;
         case IDM_REDO: Sci(SCI_REDO); return 0;
@@ -963,6 +1752,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case IDM_OPEN: OpenDocumentDialog(); return 0;
         case IDM_SAVE: SaveDocument(true); return 0;
         case IDM_SAVEAS: SaveAsDialog(); return 0;
+        case IDM_CLOSE_DOC: CloseDocumentAt(g_activeDoc); return 0;
+        case IDM_RENAME_DOC: BeginRenameDocument(g_activeDoc); return 0;
         case IDM_FIND: ShowFindReplaceDialog(false); return 0;
         case IDM_REPLACE: ShowFindReplaceDialog(true); return 0;
         case IDM_EXIT: SendMessageW(hwnd, WM_CLOSE, 0, 0); return 0;
@@ -984,12 +1775,37 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         break;
 
+    case WM_DROPFILES:
+        HandleDroppedFiles(reinterpret_cast<HDROP>(wParam));
+        return 0;
+
+    case WM_COPYDATA: {
+        auto* cds=reinterpret_cast<COPYDATASTRUCT*>(lParam);
+        if (cds && cds->lpData && cds->cbData >= sizeof(wchar_t) &&
+            cds->cbData <= 32768 * sizeof(wchar_t) &&
+            cds->cbData % sizeof(wchar_t) == 0) {
+            const size_t chars = cds->cbData / sizeof(wchar_t);
+            const wchar_t* begin = static_cast<const wchar_t*>(cds->lpData);
+            const wchar_t* end = std::find(begin, begin + chars, L'\0');
+            if (end == begin + chars || end == begin) return FALSE;
+            if (!OpenDocumentTab(std::wstring(begin, end))) return FALSE;
+            ShowWindow(hwnd, SW_RESTORE);
+            SetForegroundWindow(hwnd);
+            return TRUE;
+        }
+        return FALSE;
+    }
     case WM_CLOSE:
-        if (!ConfirmPendingChanges()) return 0;
+        if (g_hwndRenameEdit) EndRenameEdit(false);
+        for(int i=0;i<static_cast<int>(g_notes.size());++i) {
+            SelectDocument(i);
+            if(!ConfirmPendingChanges())return 0;
+        }
         DestroyWindow(hwnd);
         return 0;
 
     case WM_DESTROY:
+        if (g_hwndFiles) RevokeDragDrop(g_hwndFiles);
         PostQuitMessage(0);
         return 0;
     }
@@ -1002,6 +1818,8 @@ static HACCEL CreateAccelerators() {
         { FCONTROL | FVIRTKEY, 'Z', IDM_UNDO },
         { FCONTROL | FVIRTKEY, 'Y', IDM_REDO },
         { FCONTROL | FVIRTKEY, 'N', IDM_NEW },
+        { FCONTROL | FVIRTKEY, 'W', IDM_CLOSE_DOC },
+        { FVIRTKEY, VK_F2, IDM_RENAME_DOC },
         { FCONTROL | FVIRTKEY, 'O', IDM_OPEN },
         { FCONTROL | FVIRTKEY, 'S', IDM_SAVE },
         { FCONTROL | FSHIFT | FVIRTKEY, 'S', IDM_SAVEAS },
@@ -1019,6 +1837,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     g_hInst = hInstance;
     g_findReplaceMsg = RegisterWindowMessageW(L"commdlg_FindReplace");
     g_appDir = GetExeDir();
+    g_sidebarWidth = std::max(SIDEBAR_MIN, std::min(SIDEBAR_MAX,
+        static_cast<int>(GetPrivateProfileIntW(
+            L"Layout", L"SidebarWidth", SIDEBAR_DEFAULT, SettingsPath().c_str()))));
     EnsureDir(JoinPath(g_appDir, L"data"));
     EnsureDir(JoinPath(g_appDir, L"backups"));
     EnsureDir(JoinPath(g_appDir, L"meta"));
@@ -1033,8 +1854,40 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     }
     if (argv) LocalFree(argv);
 
+    HANDLE instanceMutex = CreateMutexW(nullptr, FALSE,
+                                        L"Local\\LightNoteV083SingleInstance");
+    if (!instanceMutex) return 5;
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND running = nullptr;
+        for (int attempt = 0; attempt < 40 && !running; ++attempt) {
+            running = FindWindowW(L"LightNoteV083MainWindow", nullptr);
+            if (!running) Sleep(100);
+        }
+        bool delivered = running != nullptr;
+        if (running && !g_startPath.empty()) {
+            COPYDATASTRUCT cds = {};
+            cds.cbData = static_cast<DWORD>((g_startPath.size() + 1) * sizeof(wchar_t));
+            cds.lpData = const_cast<wchar_t*>(g_startPath.c_str());
+            DWORD_PTR acknowledged = 0;
+            delivered = SendMessageTimeoutW(running, WM_COPYDATA, 0,
+                        reinterpret_cast<LPARAM>(&cds), SMTO_ABORTIFHUNG,
+                        3000, &acknowledged) != 0 && acknowledged != 0;
+        }
+        if (delivered) {
+            ShowWindow(running, SW_RESTORE);
+            SetForegroundWindow(running);
+            CloseHandle(instanceMutex);
+            return 0;
+        }
+        MessageBoxW(nullptr, L"LightNote 已在运行，但现有窗口没有响应文件打开请求。",
+                    L"LightNote", MB_OK | MB_ICONWARNING);
+        CloseHandle(instanceMutex);
+        return 5;
+    }
+
     if (!Scintilla_RegisterClasses(hInstance)) {
         MessageBoxW(nullptr, L"Scintilla 初始化失败。", L"LightNote", MB_OK | MB_ICONERROR);
+        CloseHandle(instanceMutex);
         return 1;
     }
 
@@ -1042,12 +1895,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     wc.cbSize = sizeof(wc);
     wc.hInstance = hInstance;
     wc.lpfnWndProc = WndProc;
-    wc.lpszClassName = L"LightNoteMainWindow";
+    wc.lpszClassName = L"LightNoteV083MainWindow";
     wc.hCursor = LoadCursorW(nullptr, IDC_IBEAM);
     wc.hIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(1));
     wc.hIconSm = static_cast<HICON>(LoadImageW(hInstance, MAKEINTRESOURCEW(1), IMAGE_ICON, 16, 16, 0));
     wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
-    if (!RegisterClassExW(&wc)) return 2;
+    if (!RegisterClassExW(&wc)) { CloseHandle(instanceMutex); return 2; }
 
     g_hwndMain = CreateWindowExW(
         0, wc.lpszClassName, L"LightNote",
@@ -1055,7 +1908,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         CW_USEDEFAULT, CW_USEDEFAULT, 900, 700,
         nullptr, CreateMainMenu(), hInstance, nullptr);
 
-    if (!g_hwndMain) return 3;
+    if (!g_hwndMain) { CloseHandle(instanceMutex); return 3; }
 
     UpdateTitle(Sci(SCI_GETMODIFY) != 0);
     ShowWindow(g_hwndMain, nCmdShow);
@@ -1071,6 +1924,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         }
     }
     if (accel) DestroyAcceleratorTable(accel);
+    CloseHandle(instanceMutex);
 
     return static_cast<int>(msg.wParam);
 }
